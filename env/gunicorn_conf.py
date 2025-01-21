@@ -15,8 +15,40 @@ enable_stdio_inheritance = True
 daemon = True
 
 #
+# NB: something in our import chain imports requests before the gevent worker
+# monkey patches requests.  So make sure it's done immediately.
+#
+if worker_class == "gevent":
+    import gevent
+    import gevent.monkey
+    gevent.monkey.patch_all()
+
+#
 # NB: early exceptions from the app may be lost when workers fail immediately.
 # Set preload_app = True if workers fail with no apparent cause; then you'll
 # see exceptions.
 #
+
 #preload_app = True
+
+global sbt
+def on_starting(server):
+    global sbt
+
+    from searcch_backend.api.app import (app, config, db, mail, migrate)
+    from searcch_backend.api.common.alembic import maybe_auto_upgrade_db
+    from searcch_backend.api.common.scheduled_tasks import SearcchBackgroundTasks
+
+    # Run DB migrations
+    maybe_auto_upgrade_db(app, db, migrate)
+
+    # Run Scheduler
+    sbt = SearcchBackgroundTasks(config, app, db, mail)
+
+#
+# Brutal hack.  We only want to run the background tasks in the arbiter, but to
+# do that, the only hook we have is on_starting.  Therefore, we must stop the
+# scheduler in the workers after they fork.
+#
+def post_fork(server, worker):
+    sbt.stopScheduledTask()

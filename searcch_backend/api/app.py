@@ -10,6 +10,7 @@ from flask_restful import Api
 from flask_sqlalchemy import SQLAlchemy
 from flask_marshmallow import Marshmallow
 from flask_migrate import Migrate
+from flask_mail import Mail
 
 # set up configurations
 app = Flask(__name__, instance_relative_config=True)
@@ -18,11 +19,12 @@ app.config.from_object(app_config[config_name])
 if os.getenv('FLASK_INSTANCE_CONFIG_FILE'):
     app.config.from_pyfile(os.getenv('FLASK_INSTANCE_CONFIG_FILE'))
 
-
+config = app.config
 db = SQLAlchemy(app)
 migrate = Migrate(app, db, directory="searcch_backend/migrations")
 ma = Marshmallow(app)
 api = Api(app)
+mail = Mail(app)
 
 @app.teardown_appcontext
 def shutdown_session(exception=None):
@@ -50,40 +52,12 @@ if "DEBUG" in app.config and app.config["DEBUG"]:
 
 app.logger.debug("flask config: %r",app.config)
 
-if "DB_AUTO_MIGRATE" in app.config and app.config["DB_AUTO_MIGRATE"]:
-    with app.app_context():
-        #
-        # All this work to safely auto-migrate in the presence of multiple
-        # processes.  NB: the table create is separated out due to racy table
-        # creation semantics in postgres:
-        # https://www.postgresql.org/message-id/CA+TgmoZAdYVtwBfp1FL2sMZbiHCWT4UPrzRLNnX1Nb30Ku3-gg@mail.gmail.com
-        #
-        import alembic
-        # First create the table (we don't have alembic_versions until later).
-        try:
-            db.session.execute("create table if not exists alembic_lock (locked boolean)")
-        except:
-            db.session.commit()
-        # Lock the table.
-        try:
-            db.session.execute("lock table alembic_lock in exclusive mode")
-        except:
-            app.logger.error("failed to lock before auto_migrate")
-            raise
-        # Migrate.
-        try:
-            alembic.command.upgrade(migrate.get_config(),"head")
-        except:
-            app.logger.error("failed to auto_migrate database; exiting")
-            raise
-        app.logger.info("auto_migrated database")
-        # Commit (unlock).
-        db.session.commit()
-
 from searcch_backend.api.resources.artifact import (
     ArtifactAPI, ArtifactIndexAPI,
-    ArtifactRelationshipResourceRoot, ArtifactRelationshipResource)
+    ArtifactRelationshipResourceRoot, ArtifactRelationshipResource, ArtifactOwnerRequestAPI, ArtifactOwnerRequestsAPI)
+from searcch_backend.api.resources.artifact_compare import ArtifactCompareAPI
 from searcch_backend.api.resources.artifact_search import ArtifactSearchIndexAPI, ArtifactRecommendationAPI
+from searcch_backend.api.resources.candidate_artifact import CandidateArtifactResource
 from searcch_backend.api.resources.organization import OrganizationAPI, OrganizationListAPI
 from searcch_backend.api.resources.login import LoginAPI
 from searcch_backend.api.resources.session import (
@@ -93,7 +67,7 @@ from searcch_backend.api.resources.review import ReviewAPI, ReviewListAPI
 from searcch_backend.api.resources.favorite import FavoriteAPI, FavoritesListAPI
 from searcch_backend.api.resources.user import (
     UserProfileAPI, UserArtifactsAPI, UserAffiliationResourceRoot,
-    UserAffiliationResource, UsersIndexAPI)
+    UserAffiliationResource, UsersIndexAPI, EmailOptOutResource)
 from searcch_backend.api.resources.dashboard import UserDashboardAPI, ArtifactStatsAPI
 from searcch_backend.api.resources.interests import InterestsListAPI
 from searcch_backend.api.resources.artifact_import import (
@@ -102,8 +76,11 @@ from searcch_backend.api.resources.importer import (
     ImporterResourceRoot, ImporterResource)
 from searcch_backend.api.resources.schema import (
     SchemaArtifactAPI, SchemaAffiliationAPI)
+from searcch_backend.api.resources.recurring_venue import RecurringVenueResourceRoot, RecurringVenueResource
+from searcch_backend.api.resources.venue import VenueResourceRoot, VenueResource
 from searcch_backend.api.resources.badge import BadgeResourceRoot, BadgeResource
 from searcch_backend.api.resources.license import LicenseResourceRoot, LicenseResource
+from searcch_backend.api.resources.admin import AdminUpdatePrivileges
 
 approot = app.config['APPLICATION_ROOT']
 
@@ -113,25 +90,31 @@ api.add_resource(SessionResourceRoot, approot + '/sessions', endpoint='api.sessi
 api.add_resource(SessionResource, approot + '/session/<int:session_id>', endpoint='api.session')
 
 api.add_resource(ArtifactIndexAPI, approot + '/artifacts', endpoint='api.artifacts')
-api.add_resource(ArtifactAPI, approot + '/artifact/<int:artifact_id>', endpoint='api.artifact')
+api.add_resource(ArtifactAPI, approot + '/artifact/<int:artifact_group_id>', approot + '/artifact/<int:artifact_group_id>/<int:artifact_id>', endpoint='api.artifact')
+api.add_resource(ArtifactCompareAPI, approot + '/artifact/compare/<int:artifact_group_id>/<int:artifact_id>', endpoint='api.artifact_compare')
 api.add_resource(ArtifactSearchIndexAPI, approot + '/artifact/search', endpoint='api.artifact_search')
 api.add_resource(ArtifactRelationshipResourceRoot, approot + '/artifact/relationships', endpoint='api.artifact_relationships')
 api.add_resource(ArtifactRelationshipResource, approot + '/artifact/relationship/<int:artifact_relationship_id>', endpoint='api.artifact_relationship')
-api.add_resource(ArtifactRecommendationAPI, approot + '/artifact/recommendation/<int:artifact_id>', endpoint='api.artifact_recommender')
+api.add_resource(ArtifactRecommendationAPI, approot + '/artifact/recommendation/<int:artifact_group_id>/<int:artifact_id>', endpoint='api.artifact_recommender')
+
+api.add_resource(CandidateArtifactResource, approot + '/candidate/artifact/<int:candidate_artifact_id>', endpoint='api.candidate_artifact')
+
+api.add_resource(ArtifactOwnerRequestAPI, approot + '/artifact/request/owner/<int:artifact_group_id>', endpoint='api.artifact_request_owner')
+api.add_resource(ArtifactOwnerRequestsAPI, approot + '/artifact/requests/owner', endpoint='api.artifact_requests_owner')
 
 api.add_resource(OrganizationListAPI, approot + '/organizations', endpoint='api.organizations')
 api.add_resource(OrganizationAPI, approot + '/organization/<int:org_id>', endpoint='api.organization')
 
 api.add_resource(InterestsListAPI, approot + '/interests', endpoint='api.interests')
 
-api.add_resource(RatingAPI, approot + '/rating/<int:artifact_id>', endpoint='api.rating')
-api.add_resource(UserRatingAPI, approot + '/rating/user/<int:user_id>/artifact/<int:artifact_id>', endpoint='api.userrating')
+api.add_resource(RatingAPI, approot + '/rating/<int:artifact_group_id>', endpoint='api.rating')
+api.add_resource(UserRatingAPI, approot + '/rating/user/<int:user_id>/artifact/<int:artifact_group_id>', endpoint='api.userrating')
 
-api.add_resource(ReviewAPI, approot + '/review/<int:artifact_id>', endpoint='api.review')
-api.add_resource(ReviewListAPI, approot + '/reviews/<int:artifact_id>', endpoint='api.reviews')
+api.add_resource(ReviewAPI, approot + '/review/<int:artifact_group_id>', endpoint='api.review')
+api.add_resource(ReviewListAPI, approot + '/reviews/<int:artifact_group_id>', endpoint='api.reviews')
 
 api.add_resource(FavoritesListAPI, approot + '/favorites/<int:user_id>', endpoint='api.favorites')
-api.add_resource(FavoriteAPI, approot + '/favorite/<int:artifact_id>', endpoint='api.favorite')
+api.add_resource(FavoriteAPI, approot + '/favorite/<int:artifact_group_id>', endpoint='api.favorite')
 
 api.add_resource(UsersIndexAPI, approot + '/users', endpoint='api.users')
 api.add_resource(UserProfileAPI, approot + '/user/<int:user_id>', approot + '/user', endpoint='api.user')
@@ -139,6 +122,8 @@ api.add_resource(UserArtifactsAPI, approot + '/user/artifacts', endpoint='api.us
 
 api.add_resource(UserAffiliationResourceRoot, approot + '/user/affiliations', endpoint='api.user_affiliations')
 api.add_resource(UserAffiliationResource, approot + '/user/affiliation/<int:affiliation_id>', endpoint='api.user_affiliation')
+
+api.add_resource(EmailOptOutResource, approot + '/email/opt_out', endpoint='api.email_out_out')
 
 api.add_resource(UserDashboardAPI, approot + '/dashboard', endpoint='api.dashboard')
 api.add_resource(ArtifactStatsAPI, approot + '/dashboard/artifact/stats', endpoint='api.dashboard_artifact_stats')
@@ -152,8 +137,16 @@ api.add_resource(ImporterResource, approot + '/importer/<int:importer_instance_i
 api.add_resource(SchemaArtifactAPI, approot + "/schema/artifact", endpoint='api.schema_artifact')
 api.add_resource(SchemaAffiliationAPI, approot + "/schema/affiliation", endpoint='api.schema_affiliation')
 
+api.add_resource(RecurringVenueResourceRoot, approot + '/recurringvenues', endpoint='api.recurringvenues')
+api.add_resource(RecurringVenueResource, approot + '/recurringvenue/<int:recurring_venue_id>', endpoint='api.recurringvenue')
+
+api.add_resource(VenueResourceRoot, approot + '/venues', endpoint='api.venues')
+api.add_resource(VenueResource, approot + '/venue/<int:venue_id>', endpoint='api.venue')
+
 api.add_resource(BadgeResourceRoot, approot + '/badges', endpoint='api.badges')
 api.add_resource(BadgeResource, approot + '/badge/<int:badge_id>', endpoint='api.badge')
 
 api.add_resource(LicenseResourceRoot, approot + '/licenses', endpoint='api.licenses')
 api.add_resource(LicenseResource, approot + '/license/<int:org_id>', endpoint='api.license')
+
+api.add_resource(AdminUpdatePrivileges, approot + '/admin/user/<int:user_id>', endpoint='api.admin')

@@ -16,7 +16,7 @@ from searcch_backend.models.schema import *
 LOG = logging.getLogger(__name__)
 
 def verify_strategy(strategy):
-    if strategy not in ['github']:
+    if strategy not in [ 'github', 'google', 'cilogon' ]:
         abort(403, description="missing/incorrect strategy")
 
 
@@ -66,6 +66,9 @@ class LoginAPI(Resource):
                                    required=True,
                                    help='Set admin mode for this session, if authorized')
 
+        self._google_userinfo_endpoint = None
+        self._cilogon_userinfo_endpoint = None
+
     def put(self):
         verify_api_key(request)
         login_session = verify_token(request)
@@ -79,6 +82,85 @@ class LoginAPI(Resource):
 
         return Response(status=200)
 
+    def _validate_github(self, sso_token):
+        # get email/name from Github
+        github_user_api = 'https://api.github.com/user'
+        headers = {
+            'Accept': 'application/vnd.github.v3+json',
+            'Authorization': sso_token
+        }
+        response = requests.get(github_user_api, headers=headers)
+        if response.status_code != requests.codes.ok:
+            abort(response.status_code, description="invalid SSO token")
+        response_json = response.json()
+        return (response_json["email"], response_json.get("name", response_json["login"]), response_json["id"])
+
+    @property
+    def google_userinfo_endpoint(self):
+        if self._google_userinfo_endpoint:
+            return self._google_userinfo_endpoint
+
+        response = requests.get(
+            "https://accounts.google.com/.well-known/openid-configuration")
+        if response.status_code != requests.codes.ok:
+            abort(response.status_code,
+                  description="unexpected error from IDP (%r)" % (response.status_code,))
+        try:
+            self._google_userinfo_endpoint = response.json()["userinfo_endpoint"]
+        except:
+            abort(500, description="unexpected error with IDP")
+
+        return self._google_userinfo_endpoint
+
+    def _validate_google(self, sso_token):
+        userinfo_endpoint = self.google_userinfo_endpoint
+        headers = {
+            'Authorization': sso_token
+        }
+        response = requests.get(userinfo_endpoint, headers=headers)
+        if response.status_code != requests.codes.ok:
+            abort(response.status_code, description="invalid SSO token")
+        response_json = response.json()
+        return (response_json["email"], response_json.get("displayName", None), response_json["sub"])
+
+    @property
+    def cilogon_userinfo_endpoint(self):
+        if self._cilogon_userinfo_endpoint:
+            return self._cilogon_userinfo_endpoint
+
+        response = requests.get(
+            "https://cilogon.org/.well-known/openid-configuration")
+        if response.status_code != requests.codes.ok:
+            abort(response.status_code,
+                  description="unexpected error from IDP (%r)" % (response.status_code,))
+        try:
+            self._cilogon_userinfo_endpoint = response.json()["userinfo_endpoint"]
+        except:
+            abort(500, description="unexpected error with IDP")
+
+        return self._cilogon_userinfo_endpoint
+
+    def _validate_cilogon(self, sso_token):
+        userinfo_endpoint = self.cilogon_userinfo_endpoint
+        headers = {
+            'Authorization': sso_token
+        }
+        response = requests.get(userinfo_endpoint, headers=headers)
+        if response.status_code != requests.codes.ok:
+            abort(response.status_code, description="invalid SSO token")
+        response_json = response.json()
+        return (response_json["email"], response_json.get("name", None), response_json["sub"])
+
+    def _validate_token(self, strategy, sso_token):
+        if strategy == "github":
+            return self._validate_github(sso_token)
+        elif strategy == "google":
+            return self._validate_google(sso_token)
+        elif strategy == "cilogon":
+            return self._validate_cilogon(sso_token)
+        abort(405, description="invalid IDP strategy")
+
+
     def post(self):
         args = self.reqparse.parse_args(strict=True)
 
@@ -90,23 +172,40 @@ class LoginAPI(Resource):
         sso_token = args.get('token')
         login_session = lookup_token(sso_token)
         if not login_session:
-            # get email from Github
-            github_user_email_api = 'https://api.github.com/user/emails'
-            headers = {
-                'Accept': 'application/vnd.github.v3+json',
-                'Authorization': sso_token
-            }
-            response = requests.get(github_user_email_api, headers=headers)
-            if response.status_code != requests.codes.ok:
-                abort(response.status_code, description="invalid SSO token")
-            response_json = response.json()[0]
-            user_email = response_json["email"]
+            (user_email, user_name, idp_uid) = self._validate_token(strategy, sso_token)
+            idp_uid = str(idp_uid) if idp_uid else None
+
+            if not user_email or user_email.find("@") <= 0:
+                abort(403, description="Identity provider did not share your email address; check your profile's security settings at your provider")
 
             # check if User entity with that email exists
             user = db.session.query(User).\
               join(Person, Person.id == User.person_id).\
               filter(Person.email == user_email).\
               first()
+
+            if user:
+                # check if User entity has a UserIdPCredential with this strategy
+                idp_credential = db.session.query(UserIdPCredential).\
+                    filter(UserIdPCredential.user_id == user.id).\
+                    first()
+                if idp_credential:
+                    setattr(idp_credential, strategy + '_id', idp_uid)
+                else:
+                    idp_credential = UserIdPCredential(
+                        user=user, **{strategy + '_id': idp_uid})
+                    db.session.add(idp_credential)
+            else:
+                user = db.session.query(User).\
+                    join(UserIdPCredential, UserIdPCredential.user_id == User.id).\
+                    filter(getattr(UserIdPCredential, strategy + '_id') == idp_uid).\
+                    first()
+                # update user email if it has changed
+                if user:
+                    LOG.debug("updating user email from %s to %s", user.person.email, user_email)
+                    person = user.person
+                    if person.email != user_email:
+                        person.email = user_email
 
             if user:  # create new session
                 (login_session, is_new) = create_new_session(user, sso_token)
@@ -127,20 +226,7 @@ class LoginAPI(Resource):
                 response.headers.add('Access-Control-Allow-Origin', '*')
                 response.status_code = 200
                 return response
-            else:  # create new user
-                github_user_details_api = 'https://api.github.com/user'
-                headers = {
-                    'Accept': 'application/vnd.github.v3+json',
-                    'Authorization': sso_token
-                }
-                response = requests.get(github_user_details_api, headers=headers)
-                
-                if response.status_code != requests.codes.ok:
-                    abort(response.status_code, description="invalid SSO token")
-                
-                user_details_json = response.json()
-                user_name = user_details_json["name"] if user_details_json["name"] else user_details_json["login"]
-
+            else: # create new user
                 # create database entities
                 #
                 # Handle race condition due to not locking this table where
@@ -156,7 +242,9 @@ class LoginAPI(Resource):
                 #
                 new_person = Person(name=user_name, email=user_email)
                 new_user = User(person=new_person)
+                new_user_idp_cred = UserIdPCredential(user=new_user, **{strategy + '_id': idp_uid})
                 db.session.add(new_user)
+                db.session.add(new_user_idp_cred)
 
                 (login_session, is_new) = create_new_session(new_user, sso_token)
                 if not is_new:

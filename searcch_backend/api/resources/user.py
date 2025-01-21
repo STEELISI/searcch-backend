@@ -1,5 +1,6 @@
 # logic for /rating
 
+from datetime import datetime
 from searcch_backend.api.app import db, config_name
 from searcch_backend.api.common.auth import (verify_api_key, verify_token)
 from searcch_backend.api.common.sql import object_from_json
@@ -7,7 +8,7 @@ from searcch_backend.models.model import *
 from searcch_backend.models.schema import *
 from flask import abort, jsonify, request, url_for, Blueprint
 from flask_restful import reqparse, Resource, fields, marshal
-from sqlalchemy import func, desc, asc, sql, or_
+from sqlalchemy import func, desc, asc, sql, or_, and_
 import sqlalchemy
 import sys
 import logging
@@ -15,6 +16,7 @@ import math
 
 import base64
 import werkzeug
+
 
 LOG = logging.getLogger(__name__)
 
@@ -223,10 +225,20 @@ class UserArtifactsAPI(Resource):
         user = db.session.query(User).filter(User.id == login_session.user_id).first()
 
         artifact_schema = ArtifactSchema(many=True)
-        owned_artifacts = db.session.query(Artifact).filter(Artifact.owner_id == login_session.user_id)
+
+        owned_artifacts = db.session.query(Artifact).\
+          join(ArtifactGroup, Artifact.artifact_group_id == ArtifactGroup.id).\
+          join(ArtifactPublication, Artifact.id == ArtifactPublication.artifact_id, isouter=True).\
+          filter(or_(and_(ArtifactGroup.owner_id == login_session.user_id,\
+                          ArtifactPublication.id != None),\
+                     Artifact.owner_id == login_session.user_id)).\
+          order_by(Artifact.artifact_group_id, Artifact.ctime.desc()).\
+          distinct(Artifact.artifact_group_id)
+
+        owned_artifacts = artifact_schema.dump(owned_artifacts)
 
         response = jsonify({
-            "owned_artifacts": artifact_schema.dump(owned_artifacts)
+            "owned_artifacts": owned_artifacts
         })
         
         response.headers.add('Access-Control-Allow-Origin', '*')
@@ -369,3 +381,41 @@ class UserAffiliationResource(Resource):
         response.headers.add('Access-Control-Allow-Origin', '*')
         response.status_code = 200
         return response
+
+class EmailOptOutResource(Resource):
+
+    def __init__(self):
+        self.postparse = reqparse.RequestParser()
+        self.postparse.add_argument(
+            name='email', type=str, required=True,
+            help='Invalid email address for opt out request')
+        self.postparse.add_argument(
+            name='key', type=str, required=True,
+            help='Invalid claim key for opt out request')
+        super(EmailOptOutResource, self).__init__()
+
+    def post(self):
+        """
+        Opt out of email communications
+        """
+        args = self.postparse.parse_args()
+        email = args.get('email', '')
+        key = args.get('key', '')
+        if not email or not key:
+            response = jsonify({'message': 'Malformed request: must supply both email and key'})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            response.status_code = 400
+            return response
+        record: OwnershipEmail = db.session.query(OwnershipEmail).filter_by(email=email, key=key).first()
+        if not record or record.valid_until < datetime.today():
+            response = jsonify({'message': 'email or key not found'})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            response.status_code = 401
+            return response
+        else:
+            record.opt_out = True
+            db.session.commit()
+            response = jsonify({'message': 'opted out of future communication'})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            response.status_code = 200
+            return response

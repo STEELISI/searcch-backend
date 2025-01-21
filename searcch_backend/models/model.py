@@ -3,6 +3,14 @@ from sqlalchemy.dialects.postgresql import TSVECTOR, BYTEA
 from sqlalchemy import Table, MetaData
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
+from sqlalchemy import event
+from sqlalchemy.sql import text
+import hashlib
+import logging
+
+import searcch_backend.api.common.sql
+
+LOG = logging.getLogger(__name__)
 
 metadata = MetaData()
 Base = declarative_base(metadata=metadata)
@@ -20,6 +28,54 @@ RELATION_TYPES = (
     "requires", "processes", "produces"
 )
 
+class FileContent(db.Model):
+    __tablename__ = "file_content"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    content = db.Column(db.LargeBinary(), nullable=False)
+    hash = db.Column(db.Binary(32), nullable=False)
+    size = db.Column(db.BigInteger, nullable=False)
+
+    __table_args__ = (
+        db.UniqueConstraint("hash"),
+    )
+
+    __user_ro_fields__ = (
+        "hash",
+    )
+
+    @classmethod
+    def make_hash(kls,content):
+        m = hashlib.sha256()
+        m.update(content)
+        d = m.digest()
+        return d
+
+    def __repr__(self):
+        return "<FileContent(id=%r,hash=%r,size=%r)>" % (
+            self.id, self.hash, self.size )
+
+#
+# Both our primary key and hash are UNIQUE.  The migration that added this
+# table IGNOREs conflicts on updates.  But that means that to make inserts of
+# "new" content seamless, we have to update any objects without their primary
+# keys set, if there is an existing hash match.  We also calculate the hash and
+# size fields if they are missing.
+#
+@event.listens_for(FileContent, 'before_insert')
+def file_content_fixups(mapper, connection, target):
+    if not target.hash:
+        target.hash = FileContent.make_hash(target.content)
+    if target.size is None:
+        target.size = len(target.content)
+    if target.id is None:
+        res = connection.execute(text("select id from file_content where hash=:hashval"),
+                                 hashval=target.hash)
+        row = res.first()
+        if row:
+            target.id = row["id"]
+
+
 class ArtifactFile(db.Model):
     __tablename__ = "artifact_files"
 
@@ -28,18 +84,19 @@ class ArtifactFile(db.Model):
     url = db.Column(db.String(512), nullable=False)
     name = db.Column(db.String(512))
     filetype = db.Column(db.String(128), nullable=False)
-    content = db.Column(db.LargeBinary())
+    file_content_id = db.Column(db.Integer, db.ForeignKey("file_content.id"))
     size = db.Column(db.BigInteger)
     mtime = db.Column(db.DateTime)
     
+    file_content = db.relationship("FileContent", uselist=False)
     members = db.relationship("ArtifactFileMember", uselist=True)
 
     __table_args__ = (
         db.UniqueConstraint("artifact_id", "url"),)
 
     def __repr__(self):
-        return "<ArtifactFile(id=%r,artifact_id=%r,url=%r,name=%r,size=%r,mtime=%r)>" % (
-            self.id, self.artifact_id, self.url, self.name, self.size,
+        return "<ArtifactFile(id=%r,artifact_id=%r,file_content_id=%r,url=%r,name=%r,mtime=%r)>" % (
+            self.id, self.artifact_id, self.file_content_id, self.url, self.name,
             self.mtime.isoformat() if self.mtime else "")
 
 
@@ -53,9 +110,11 @@ class ArtifactFileMember(db.Model):
     download_url = db.Column(db.String(512))
     name = db.Column(db.String(512))
     filetype = db.Column(db.String(128), nullable=False)
-    content = db.Column(db.LargeBinary())
+    file_content_id = db.Column(db.Integer, db.ForeignKey("file_content.id"))
     size = db.Column(db.Integer)
     mtime = db.Column(db.DateTime)
+
+    file_content = db.relationship("FileContent",uselist=False)
 
     __table_args__ = (
         db.UniqueConstraint("parent_file_id", "pathname"),)
@@ -107,6 +166,9 @@ class ArtifactPublication(db.Model):
     notes = db.Column(db.Text)
     publisher_id = db.Column(
         db.Integer, db.ForeignKey("users.id"), nullable=False)
+    version = db.Column(db.Integer, nullable=False)
+
+    artifact = db.relationship("Artifact", uselist=False)
     publisher = db.relationship("User", uselist=False)
 
     def __repr__(self):
@@ -193,19 +255,23 @@ class ArtifactRelationship(db.Model):
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     artifact_id = db.Column(db.Integer, db.ForeignKey("artifacts.id"))
+    artifact_group_id = db.Column(db.Integer, db.ForeignKey("artifact_groups.id"), nullable=False)
     relation = db.Column(db.Enum(
         *RELATION_TYPES,
         name="artifact_relationship_enum"))
     related_artifact_id = db.Column(db.Integer, db.ForeignKey("artifacts.id"))
-    # related_artifact = db.relationship("Artifact", uselist=False, foreign_keys=[related_artifact_id], backref="related_artifacts")
-    related_artifact = db.relationship(
-        "Artifact", uselist=False, foreign_keys=[related_artifact_id], viewonly=True)
+    related_artifact_group_id = db.Column(db.Integer, db.ForeignKey("artifact_groups.id"), nullable=False)
+
+    artifact_group = db.relationship(
+        "ArtifactGroup", uselist=False, foreign_keys=[artifact_group_id], viewonly=True)
+    related_artifact_group = db.relationship(
+        "ArtifactGroup", uselist=False, foreign_keys=[related_artifact_group_id], viewonly=True)
 
     __table_args__ = (
-        db.UniqueConstraint("artifact_id", "relation", "related_artifact_id"),)
+        db.UniqueConstraint("artifact_group_id", "relation", "related_artifact_group_id"),)
 
     __user_ro_relationships__ = (
-        "related_artifact",
+        "related_artifact_group",
     )
 
 
@@ -299,6 +365,23 @@ class User(db.Model):
         return "<User(id=%r,person_id=%r,can_admin=%r)>" % (
             self.id, self.person_id, self.can_admin)
 
+class UserIdPCredential(db.Model):
+    __tablename__ = "user_idp_credentials"
+
+    user_id = db.Column(db.Integer, db.ForeignKey(
+        "users.id"), primary_key=True)
+    github_id = db.Column(db.Integer, nullable=True)
+    google_id = db.Column(db.String(256), nullable=True)
+    cilogon_id = db.Column(db.String(256), nullable=True)
+
+    user = db.relationship("User", uselist=False)
+
+    __table_args__ = (
+        db.UniqueConstraint("github_id", "google_id", "cilogon_id"),)
+
+    def __repr__(self) -> str:
+        return "<UserIdPCredential(user_id=%r,github_id=%r,google_id=%r,cilogon_id=%r)>" % (
+            self.user_id, self.github_id, self.google_id, self.cilogon_id)
 
 class License(db.Model):
     __tablename__ = "licenses"
@@ -399,6 +482,105 @@ class PersonMetadata(db.Model):
             self.id, self.name)
 
 
+class RecurringVenue(db.Model):
+    __tablename__ = "recurring_venues"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    type = db.Column(
+        db.Enum(
+            "conference", "journal", "magazine", "newspaper", "periodical",
+            "event", "other",
+            name="recurring_venue_enum"),
+        nullable=False)
+    title = db.Column(db.String(1024), nullable=False)
+    abbrev = db.Column(db.String(64))
+    url = db.Column(db.String(1024), nullable=False)
+    description = db.Column(db.Text)
+    publisher_url = db.Column(db.String(1024), nullable=True)
+    verified = db.Column(db.Boolean, nullable=False, default=False)
+    recurring_venue_tsv = db.Column(TSVECTOR)
+
+    recurrences = db.relationship("Venue", uselist=True, viewonly=True)
+
+    @classmethod
+    def object_match(cls, session, skip_primary_keys=True, skip_foreign_keys=True,
+                     none_wild=True, **kwargs):
+        return searcch_backend.api.common.sql.object_match(
+            cls, session, skip_primary_keys=skip_primary_keys,
+            skip_foreign_keys=skip_foreign_keys, none_wild=none_wild,
+            **kwargs)
+
+    def __repr__(self):
+        return "<RecurringVenue(type=%r,title=%r,url=%r,verified=%r)>" % (
+            self.type, self.title, self.url, self.verified)
+
+
+class Venue(db.Model):
+    __tablename__ = "venues"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    type = db.Column(
+        db.Enum(
+            "conference", "journal", "magazine", "newspaper", "periodical",
+            "event", "other",
+            name="venue_enum"),
+        nullable=False)
+    title = db.Column(db.String(1024), nullable=False)
+    abbrev = db.Column(db.String(64))
+    url = db.Column(db.String(1024), nullable=False)
+    description = db.Column(db.Text)
+    location = db.Column(db.String(1024))
+    year = db.Column(db.Integer)
+    month = db.Column(db.Integer)
+    start_day = db.Column(db.Integer)
+    end_day = db.Column(db.Integer)
+    publisher = db.Column(db.String(1024))
+    publisher_location = db.Column(db.String(1024))
+    publisher_url = db.Column(db.String(1024))
+    isbn = db.Column(db.String(128))
+    issn = db.Column(db.String(128))
+    doi = db.Column(db.String(128))
+    volume = db.Column(db.Integer)
+    issue = db.Column(db.Integer)
+    verified = db.Column(db.Boolean, nullable=False, default=False)
+    venue_tsv = db.Column(TSVECTOR)
+    recurring_venue_id = db.Column(
+        db.Integer, db.ForeignKey("recurring_venues.id"), nullable=True)
+
+    recurring_venue = db.relationship("RecurringVenue", uselist=False)
+
+    @classmethod
+    def object_match(cls, session, skip_primary_keys=True, skip_foreign_keys=True,
+                     none_wild=True, **kwargs):
+        return searcch_backend.api.common.sql.object_match(
+            cls, session, skip_primary_keys=skip_primary_keys,
+            skip_foreign_keys=skip_foreign_keys, none_wild=none_wild,
+            **kwargs)
+
+    def __repr__(self):
+        return "<Venue(type=%r,title=%r,url=%r,verified=%r)>" % (
+            self.type, self.title, self.url, self.verified)
+
+
+class ArtifactVenue(db.Model):
+    __tablename__ = "artifact_venues"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    artifact_id = db.Column(
+        db.Integer, db.ForeignKey("artifacts.id"), nullable=False)
+    venue_id = db.Column(db.Integer, db.ForeignKey("venues.id"),
+                         nullable=False)
+
+    venue = db.relationship("Venue", uselist=False)
+
+    __table_args__ = (
+        db.UniqueConstraint("artifact_id","venue_id"),)
+
+    def __repr__(self):
+        return "<ArtifactVenue(artifact_id=%r,venue_id=%r)>" % (
+            self.artifact_id, self.venue_id)
+
+
 class Badge(db.Model):
     __tablename__ = "badges"
 
@@ -450,18 +632,20 @@ class ArtifactRatings(db.Model):
             'rating >= 0', name='artifact_ratings_valid_rating_lower_bound'),
         db.CheckConstraint(
             'rating <= 5', name='artifact_ratings_valid_rating_upper_bound'),
-        db.UniqueConstraint("artifact_id", "user_id"),
+        db.UniqueConstraint("artifact_group_id", "user_id"),
     )
 
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
     artifact_id = db.Column(db.Integer, db.ForeignKey(
-        "artifacts.id"), nullable=False)
+        "artifacts.id"), nullable=True)
+    artifact_group_id = db.Column(db.Integer, db.ForeignKey(
+        "artifact_groups.id"), nullable=False)
     rating = db.Column(db.Integer, nullable=False)
 
     def __repr__(self):
-        return "<ArtifactRatings(id=%r, user_id=%r,artifact_id=%r,rating='%d')>" % (
-            self.id, self.user_id, self.artifact_id, self.rating)
+        return "<ArtifactRatings(id=%r, user_id=%r,artifact_group_id=%r,rating='%d')>" % (
+            self.id, self.user_id, self.artifact_group_id, self.rating)
 
 
 class ArtifactReviews(db.Model):
@@ -470,31 +654,35 @@ class ArtifactReviews(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
     artifact_id = db.Column(db.Integer, db.ForeignKey(
-        "artifacts.id"), nullable=False)
+        "artifacts.id"), nullable=True)
+    artifact_group_id = db.Column(db.Integer, db.ForeignKey(
+        "artifact_groups.id"), nullable=False)
     review = db.Column(db.Text, nullable=False)
     review_time = db.Column(db.DateTime, nullable=False)
 
     reviewer = db.relationship("User")
 
     def __repr__(self):
-        return "<ArtifactReviews(id=%r, user_id=%r,artifact_id=%r,review='%s')>" % (
-            self.id, self.user_id, self.artifact_id, self.review)
+        return "<ArtifactReviews(id=%r, user_id=%r,artifact_group_id=%r,review='%s')>" % (
+            self.id, self.user_id, self.artifact_group_id, self.review)
 
 
 class ArtifactFavorites(db.Model):
     __tablename__ = "artifact_favorites"
     __table_args__ = (
-        db.UniqueConstraint("artifact_id", "user_id"),
+        db.UniqueConstraint("artifact_group_id", "user_id"),
     )
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
     artifact_id = db.Column(db.Integer, db.ForeignKey(
-        "artifacts.id"), nullable=False)
+        "artifacts.id"), nullable=True)
+    artifact_group_id = db.Column(db.Integer, db.ForeignKey(
+        "artifact_groups.id"), nullable=False)
 
     def __repr__(self):
-        return "<ArtifactFavorites(id=%r, user_id=%r,artifact_id=%r)>" % (
-            self.id, self.user_id, self.artifact_id)
+        return "<ArtifactFavorites(id=%r, user_id=%r,artifact_group_id=%r)>" % (
+            self.id, self.user_id, self.artifact_group_id)
 
 
 class Sessions(db.Model):
@@ -515,6 +703,42 @@ class Sessions(db.Model):
             % (self.id, self.user_id, self.user.can_admin, self.sso_token, self.is_admin)
 
 
+class ArtifactGroup(db.Model):
+    __tablename__ = "artifact_groups"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    owner_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    publication_id = db.Column(db.Integer, db.ForeignKey("artifact_publications.id"))
+    next_version = db.Column(db.Integer, nullable=False)
+
+    owner = db.relationship("User", uselist=False)
+    publication = db.relationship("ArtifactPublication", uselist=False)
+    relationships = db.relationship(
+        "ArtifactRelationship",uselist=True,
+        foreign_keys=[ArtifactRelationship.artifact_group_id])
+    reverse_relationships = db.relationship(
+        "ArtifactRelationship",uselist=True,
+        foreign_keys=[ArtifactRelationship.related_artifact_group_id])
+    publications = db.relationship(
+        "ArtifactPublication", uselist=True, viewonly=True,
+        #secondary="join(Artifact, ArtifactGroup, Artifact.artifact_group_id == ArtifactGroup.id)",
+        #secondaryjoin="Artifact.artifact_group_id == ArtifactGroup.id",
+        secondary="join(Artifact, ArtifactPublication, Artifact.id == ArtifactPublication.artifact_id)",
+        secondaryjoin="Artifact.id == ArtifactPublication.artifact_id",
+        primaryjoin="ArtifactGroup.id == Artifact.artifact_group_id")
+
+    __user_ro_fields__ = (
+        "owner_id",
+    )
+    __user_ro_relationships__ = (
+        "owner", "relationships", "reverse_relationships"
+    )
+
+    def __repr__(self):
+        return "<ArtifactGroup(id=%r, owner=%r)>" \
+            % (self.id, self.owner_id)
+
+
 class Artifact(db.Model):
     # The Artifact class provides an internal model of a SEARCCH artifact.
     # An artifact is an entity that may be added to or edited within the SEARCCH Hub.
@@ -522,8 +746,9 @@ class Artifact(db.Model):
     __tablename__ = "artifacts"
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    artifact_group_id = db.Column(
+        db.Integer, db.ForeignKey("artifact_groups.id"), nullable=False)
     type = db.Column(db.Enum(*ARTIFACT_TYPES,name="artifact_enum"))
-    version = db.Column(db.Integer, nullable=False, default=0)
     url = db.Column(db.String(1024), nullable=False)
     ext_id = db.Column(db.String(512))
     title = db.Column(db.Text, nullable=False)
@@ -541,41 +766,139 @@ class Artifact(db.Model):
     parent_id = db.Column(db.Integer, db.ForeignKey(
         "artifacts.id"), nullable=True)
 
+    artifact_group = db.relationship("ArtifactGroup", uselist=False)
     exporter = db.relationship("Exporter", uselist=False)
+    # Needs to map to ArtifactLicense(id,license_id)
     license = db.relationship("License", uselist=False)
     meta = db.relationship("ArtifactMetadata")
     tags = db.relationship("ArtifactTag")
     files = db.relationship("ArtifactFile")
+    # This is "root" -- we need a permissions/role table?
     owner = db.relationship("User", uselist=False)
+    # Per-version; only null when user manually created this version
     importer = db.relationship("Importer", uselist=False)
-    parent = db.relationship("Artifact", uselist=False)
     curations = db.relationship("ArtifactCuration")
     publication = db.relationship("ArtifactPublication", uselist=False)
     releases = db.relationship("ArtifactRelease", uselist=True)
     affiliations = db.relationship("ArtifactAffiliation")
-    relationships = db.relationship(
-        "ArtifactRelationship",uselist=True,
-        foreign_keys=[ArtifactRelationship.artifact_id])
-    reverse_relationships = db.relationship(
-        "ArtifactRelationship",uselist=True,
-        foreign_keys=[ArtifactRelationship.related_artifact_id])
     badges = db.relationship("ArtifactBadge", uselist=True)
+    venues = db.relationship("ArtifactVenue", uselist=True)
+    candidate_relationships = db.relationship(
+        "CandidateArtifactRelationship", uselist=True)
 
     # NB: all foreign keys are read-only, so not included here.
     __user_ro_fields__ = (
-        "version","ctime","mtime","ext_id" )
+        "artifact_group_id","parent_id","version","ctime","mtime","ext_id","owner_id" )
     __user_ro_relationships__ = (
-        "exporter","owner","importer","parent","curations","publication",
-        "relationships"
+        "exporter","owner","importer","curations","publication","artifact_group"
     )
     __user_skip_relationships__ = (
         "curations",
+    )
+    __clone_skip_relationships__ = (
+        'curations', 'publication', 'owner', 'importer', 'exporter',
+    )
+    __clone_skip_fields__ = (
+        'importer_id', 'exporter_id', 'parent_id', 'owner_id', 'ctime', 'mtime',
     )
 
     def __repr__(self):
         return "<Artifact(id=%r,title='%s',description='%s',type='%s',url='%s',owner='%r',files='%r',tags='%r',metadata='%r',publication='%r')>" % (
             self.id, self.title, self.description, self.type, self.url, self.owner, self.files, self.tags, self.meta, self.publication)
 
+
+class CandidateArtifactMetadata(db.Model):
+    __tablename__ = "candidate_artifact_metadata"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    candidate_artifact_id = db.Column(
+        db.Integer, db.ForeignKey('candidate_artifacts.id'))
+    name = db.Column(db.String(64), nullable=False)
+    value = db.Column(db.String(16384), nullable=False)
+    type = db.Column(db.String(256), nullable=True)
+    source = db.Column(db.String(256), nullable=True)
+
+    __table_args__ = (
+        db.UniqueConstraint("name", "candidate_artifact_id", "value", "type"),)
+
+    def __repr__(self):
+        return "<CandidateArtifactMetadata(candidate_artifact_id=%r,name=%r)>" % (
+            self.candidate_artifact_id, self.name)
+
+
+class CandidateArtifact(db.Model):
+    """The CandidateArtifact class allows possible/recommended ("candidate"), yet-to-be-imported Artifacts to be declared.  These have not been imported, so cannot be placed in the main Artifacts table.  We also need to model possible relationships between both candidates and existing artifacts."""
+    __tablename__ = "candidate_artifacts"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    url = db.Column(db.String(1024), nullable=False)
+    ctime = db.Column(db.DateTime, nullable=False)
+    mtime = db.Column(db.DateTime)
+    type = db.Column(db.Enum(*ARTIFACT_TYPES, name="candidate_artifact_enum"))
+    title = db.Column(db.Text())
+    name = db.Column(db.Text())
+    description = db.Column(db.Text())
+    owner_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    artifact_import_id = db.Column(
+        db.Integer, db.ForeignKey("artifact_imports.id"))
+    meta = db.relationship("CandidateArtifactMetadata")
+    owner = db.relationship("User", uselist=False)
+    artifact_import = db.relationship(
+        "ArtifactImport", uselist=False, foreign_keys=[artifact_import_id])
+    candidate_artifact_relationships = db.relationship(
+        "CandidateArtifactRelationship", uselist=True, viewonly=True)
+
+    def __repr__(self):
+        return "<CandidateArtifact(id=%r,type=%r,url=%r,ctime=%r,owner=%r,artifact_import_id=%r)>" % (
+            self.id, self.type, self.url,
+            self.ctime.isoformat(), self.owner, self.artifact_import_id)
+
+class CandidateArtifactRelationship(db.Model):
+    """The CandidateArtifactRelationship class declares a relationship between an artifact and a candidate."""
+
+    __tablename__ = "candidate_artifact_relationships"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    artifact_id = db.Column(db.Integer, db.ForeignKey("artifacts.id"))
+    relation = db.Column(db.Enum(
+        *RELATION_TYPES,
+        name="candidate_artifact_relationship_enum"))
+    related_candidate_id = db.Column(
+        db.Integer, db.ForeignKey("candidate_artifacts.id"))
+    artifact = db.relationship("Artifact", uselist=False, viewonly=True)
+    related_candidate = db.relationship(
+        "CandidateArtifact", uselist=False, foreign_keys=[related_candidate_id])
+
+    __table_args__ = (
+        db.UniqueConstraint("artifact_id", "relation", "related_candidate_id"),)
+
+    def __repr__(self):
+        return "<ArtifactCandidateRelationship(id=%r,artifact_id=%r,relation=%r,related_candidate_id=%r)>" % (
+            self.id, self.artifact_id, self.relation, self.related_candidate_id)
+
+class CandidateRelationship(db.Model):
+    """The CandidateRelationship class declares a relationship between two candidate artifacts."""
+
+    __tablename__ = "candidate_relationships"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    candidate_artifact_id = db.Column(
+        db.Integer, db.ForeignKey("candidate_artifacts.id"))
+    relation = db.Column(db.Enum(
+        *RELATION_TYPES, name="candidate_relationship_enum"))
+    related_candidate_id = db.Column(
+        db.Integer, db.ForeignKey("candidate_artifacts.id"))
+    related_candidate = db.relationship(
+        "CandidateArtifact", uselist=False, foreign_keys=[related_candidate_id])
+
+    __table_args__ = (
+        db.UniqueConstraint(
+            "candidate_artifact_id", "relation", "related_candidate_id"),)
+
+    def __repr__(self):
+        return "<CandidateRelationship(id=%r,candidate_id=%r,relation=%r,related_candidate_id=%r)>" % (
+            self.id, self.candidate_id, self.relation,
+            self.related_candidate_id)
 
 class ArtifactSearchMaterializedView(db.Model):
     # The ArtifactSearchMaterializedView class provides an internal model of a SEARCCH artifact's searchable index.
@@ -608,9 +931,11 @@ class ArtifactImport(db.Model):
         *ARTIFACT_IMPORT_TYPES,name="artifact_imports_type_enum"),
         nullable=False)
     url = db.Column(db.String(1024), nullable=False)
-    #parent_id = db.Column(db.Integer, db.ForeignKey(
-    #    "artifacts.id"), nullable=True)
     importer_module_name = db.Column(db.String(256), nullable=True)
+    nofetch = db.Column(db.Boolean(), default=False)
+    noextract = db.Column(db.Boolean(), default=False)
+    noremove = db.Column(db.Boolean(), default=False)
+    autofollow = db.Column(db.Boolean(), default=False)
     owner_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
     ctime = db.Column(db.DateTime, nullable=False)
     mtime = db.Column(db.DateTime, nullable=True)
@@ -627,23 +952,57 @@ class ArtifactImport(db.Model):
     bytes_retrieved = db.Column(db.Integer, default=0, nullable=False)
     bytes_extracted = db.Column(db.Integer, default=0, nullable=False)
     log = db.Column(db.Text, nullable=True)
-    # Only set once status=complete and phase=done
+    #
+    # If we are reimporting to create a new version, we can immediately set
+    # artifact_group_id and parent_artifact_id.  Otherwise we wait to create a
+    # new artifact_group_id and artifact_id until the import succeeds (once
+    # status=complete and phase=done).
+    #
+    artifact_group_id = db.Column(db.Integer, db.ForeignKey("artifact_groups.id"), nullable=True)
+    parent_artifact_id = db.Column(db.Integer, db.ForeignKey("artifacts.id"), nullable=True)
     artifact_id = db.Column(db.Integer, db.ForeignKey("artifacts.id"), nullable=True)
     archived = db.Column(db.Boolean, nullable=False, default=False)
 
     owner = db.relationship("User", uselist=False)
-    #parent = db.relationship("Artifact", uselist=False)
-    artifact = db.relationship("Artifact", uselist=False)
+    artifact_group = db.relationship("ArtifactGroup", uselist=False)
+    artifact = db.relationship("Artifact", uselist=False,
+        foreign_keys=[artifact_id])
+
+    candidate_artifact = db.relationship("CandidateArtifact", uselist=False)
 
     __table_args__ = (
-        db.UniqueConstraint("owner_id","url","artifact_id"),
+        db.UniqueConstraint("owner_id","url","artifact_group_id","artifact_id"),
     )
 
     def __repr__(self):
-        return "<ArtifactImport(id=%r,type=%r,url=%r,importer_module_name=%r,owner=%r,status=%r,artifact=%r)>" % (
+        return "<ArtifactImport(id=%r,type=%r,url=%r,importer_module_name=%r,owner=%r,status=%r,artifact_group=%r,artifact=%r)>" % (
             self.id, self.type, self.url, self.importer_module_name,
-            self.owner, self.status, self.artifact)
+            self.owner, self.status, self.artifact_group, self.artifact)
 
+ARTIFACT_OWNER_REQUEST_STATUS = (
+    "pending", "approved", "rejected", "pre_approved"
+)
+
+class ArtifactOwnerRequest(db.Model):
+    # The ArtifactOwnerRequest class stores all the artifact owership requesst
+
+    __tablename__ = "artifact_owner_request"
+    __table_args__ = (
+        db.UniqueConstraint("artifact_group_id", "user_id"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    artifact_group_id = db.Column(db.Integer, db.ForeignKey("artifact_groups.id"), nullable=False)
+    message = db.Column(db.Text, nullable=False)
+    ctime = db.Column(db.DateTime, nullable=False)
+    status = db.Column(db.Enum(*ARTIFACT_OWNER_REQUEST_STATUS,name="artifact_owner_request_status_enum"), nullable=False)
+    action_message = db.Column(db.Text, nullable=True)
+    action_time = db.Column(db.DateTime, nullable=True)
+    action_by_user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
+
+    user = db.relationship("User", uselist=False, foreign_keys=[user_id])
+    action_by_user = db.relationship("User", uselist=False, foreign_keys=[action_by_user_id])
 
 class ImporterInstance(db.Model):
     """
@@ -700,3 +1059,55 @@ class ImporterSchedule(db.Model):
     def __repr__(self):
         return "<ImporterSchedule(id=%r,artifact_import=%r,importer_instance=%r,schedule_time=%r" % (
             self.id, self.artifact_import, self.importer_instance, self.schedule_time)
+
+
+# Models to capture Statistical Data
+
+class StatsArtifactViews(db.Model):
+    __tablename__ = "stats_views"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    artifact_group_id = db.Column(db.Integer, db.ForeignKey("artifact_groups.id"), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
+    view_count = db.Column(db.Integer, nullable=False)
+    def __repr__(self):
+        return "<StatsArtifactViews(id=%r, artifact_group_id=%r, user_id=%r,view_count=%r)>" % (self.id, self.artifact_group_id, self.user_id, self.view_count)
+
+class StatsSearches(db.Model):
+    __tablename__ = "stats_searches"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    search_term = db.Column(db.String(512), nullable=False)
+    def __repr__(self):
+        return "<StatsSearches(id=%r, search_term=%r)>" % (self.id, self.search_term)
+
+class StatsRecentViews(db.Model):
+    __tablename__ = "recent_views"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    session_id = db.Column(db.Integer, nullable=False)
+    artifact_group_id = db.Column(db.Integer, db.ForeignKey("artifact_groups.id"), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
+    view_count = db.Column(db.Integer, nullable=False)
+    def __repr__(self):
+        return "<StatsRecentViews(id=%r, session_id=%r, artifact_group_id=%r, user_id=%r,view_count=%r)>" % (self.id, self.session_id, self.artifact_group_id, self.user_id, self.view_count)
+
+class OwnershipInvitation(db.Model):
+    __tablename__ = "ownership_invitations"
+
+    email = db.Column(db.String(256), db.ForeignKey("ownership_emails.email"), primary_key=True)
+    artifact_group_id = db.Column(db.Integer, db.ForeignKey("artifact_groups.id"), primary_key=True)
+    attempts = db.Column(db.Integer, default=0, nullable=False)
+    last_attempt = db.Column(db.DateTime, nullable=True)
+    def __repr__(self):
+        return "<OwnershipEmailInvitations(person_id=%r, artifact_group_id=%r, attempts=%r, last_attempt=%r)>" % (self.person_id, self.artifact_group_id, self.attempts, self.last_attempt)
+
+class OwnershipEmail(db.Model):
+    __tablename__ = "ownership_emails"
+
+    email = db.Column(db.String(256), primary_key=True)
+    key = db.Column(db.String(64), nullable=False)
+    valid_until = db.Column(db.DateTime, nullable=False)
+    opt_out = db.Column(db.Boolean, nullable=False, default=False)
+    def __repr__(self):
+        return "<OwnershipEmail(email=%r, key=%r, opt_out=%r, valid_until=%r)" % (self.email, self.key, self.opt_out, self.valid_until)
