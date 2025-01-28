@@ -22,7 +22,7 @@ services:
     image: searcch-backend-prod
     container_name: searcch-backend-prod
     hostname: searcch-backend-prod
-    restart: unless-stopped
+    restart: no #unless-stopped
     #build: "https://${TOKEN:-token-here}:@github.com/ITI/searcch-backend.git"
     build: .
     volumes:
