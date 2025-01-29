@@ -13,18 +13,21 @@ from flask_migrate import Migrate
 from flask_mail import Mail
 
 # set up configurations
+print("Setting up app in backend")
 app = Flask(__name__, instance_relative_config=True)
 config_name = os.getenv("FLASK_ENV", "development")
 app.config.from_object(app_config[config_name])
 if os.getenv('FLASK_INSTANCE_CONFIG_FILE'):
     app.config.from_pyfile(os.getenv('FLASK_INSTANCE_CONFIG_FILE'))
 
+print("Before migration")
 config = app.config
 db = SQLAlchemy(app)
 migrate = Migrate(app, db, directory="searcch_backend/migrations")
 ma = Marshmallow(app)
 api = Api(app)
 mail = Mail(app)
+print("After migration")
 
 @app.teardown_appcontext
 def shutdown_session(exception=None):

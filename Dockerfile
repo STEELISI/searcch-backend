@@ -5,6 +5,8 @@
 #FROM pypy:3.7-slim-buster
 FROM pypy:3.7-7.3.3-slim-buster
 
+USER root
+
 RUN \
   apt update \
   && apt install -y build-essential libpq-dev \
@@ -22,12 +24,13 @@ RUN \
 COPY searcch_backend ./searcch_backend
 COPY setup.cfg setup.py run.py ./
 
-#ENV FLASK_INSTANCE_CONFIG_FILE=/app/config-development.py
+ENV FLASK_INSTANCE_CONFIG_FILE=/app/config-production.py
 ENV FLASK_APP=run:app
 
 EXPOSE 80 5678
 
-CMD ["gunicorn","--config","gunicorn_conf.py","run:app"]
+    
+ CMD ["gunicorn","--config","gunicorn_conf.py","run:app"]
 # CMD ["flask","run","--host=0.0.0.0","--port=80"]
 # CMD ["pypy", "-m", "debugpy", "--listen", "0.0.0.0:5678", "--wait-for-client", "-m", "flask","run","--host=0.0.0.0","--port=80", "--debugger"]
-#CMD ["sleep", "infinity"]
+# CMD ["sleep", "infinity"]

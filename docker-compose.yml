@@ -25,6 +25,7 @@ services:
     restart: no #unless-stopped
     #build: "https://${TOKEN:-token-here}:@github.com/ITI/searcch-backend.git"
     build: .
+    tty: true
     volumes:
       - ${DATADIR:-/data}/searcch-backend-prod/gunicorn_conf.py:/app/gunicorn_conf.py
       - ${DATADIR:-/data}/searcch-backend-prod/config-production.py:/app/config-production.py

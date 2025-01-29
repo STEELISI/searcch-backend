@@ -8,12 +8,13 @@ timeout = 600
 accesslog = "logs/access.log"
 errorlog = "logs/error.log"
 access_log_format = '%({X-Real-IP}i)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s"'
-loglevel = "debug"
+loglevel = "info"
 pidfile = "logs/process_id.pid"
 capture_output = True
 enable_stdio_inheritance = True
-daemon = True
+daemon = False
 
+print("Gunicorn starting")
 #
 # NB: something in our import chain imports requests before the gevent worker
 # monkey patches requests.  So make sure it's done immediately.
@@ -30,6 +31,7 @@ if worker_class == "gevent":
 #
 
 #preload_app = True
+print("Gunicorn started")
 
 global sbt
 def on_starting(server):
@@ -39,12 +41,14 @@ def on_starting(server):
     from searcch_backend.api.common.alembic import maybe_auto_upgrade_db
     from searcch_backend.api.common.scheduled_tasks import SearcchBackgroundTasks
 
+    print("starting")
     # Run DB migrations
     maybe_auto_upgrade_db(app, db, migrate)
-
+    print("upgraded")
+    
     # Run Scheduler
     sbt = SearcchBackgroundTasks(config, app, db, mail)
-
+    print("Forked")
 #
 # Brutal hack.  We only want to run the background tasks in the arbiter, but to
 # do that, the only hook we have is on_starting.  Therefore, we must stop the
