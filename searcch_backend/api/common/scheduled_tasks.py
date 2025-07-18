@@ -137,6 +137,10 @@ class SearcchBackgroundTasks():
         """ Sends artifact ownership invitation emails """
 
         LOG.debug('starting email invitations task')
+        if not self.config['RECIPIENT_ALLOW_FILTER']:
+            LOG.debug('no filter')
+        else:
+            LOG.debug('Filter is %s', self.config['RECIPIENT_ALLOW_FILTER'])
         # query all artifact groups owned by an admin or by automatic-imports
         query = ArtifactGroup.query.join(ArtifactGroup.owner).join(User.person).filter(or_(User.can_admin==True, Person.email=="automatic-imports@cyberexperimentation.org")).all()
 
@@ -163,7 +167,7 @@ class SearcchBackgroundTasks():
                         # Remove those who are not on the RECIPIENT_ALLOW_FILTER list, if any.
                         if not self.config['RECIPIENT_ALLOW_FILTER'] \
                           or aaf.affiliation.person.email not in self.config['RECIPIENT_ALLOW_FILTER']:
-                            LOG.info("skipping email to filtered recipient %r", aaf.affiliation.person.email)
+                            LOG.info("skipping email to filtered recipient %r filter %r", aaf.affiliation.person.email, self.config['RECIPIENT_ALLOW_FILTER'])
                             continue
 
                         # Else, continue to email this person.

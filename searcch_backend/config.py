@@ -49,7 +49,7 @@ class ProductionConfig(Config):
     MAIL_DEFAULT_SENDER = 'support@cyberexperimentation.org'
     EMAIL_INTERVAL_DAYS = 30
     MAX_INVITATION_ATTEMPTS = 3
-    RECIPIENT_ALLOW_FILTER = []
+    RECIPIENT_ALLOW_FILTER = ['sunshine.jelena@gmail.com']
 
 app_config = {
     'development': DevelopmentConfig,

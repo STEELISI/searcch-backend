@@ -3,23 +3,24 @@
 # things for others: https://foss.heptapod.net/pypy/pypy/-/issues/3441
 #
 #FROM pypy:3.7-slim-buster
-FROM pypy:3.7-7.3.3-slim-buster
+FROM debian:stable-slim
 
 USER root
 
 RUN \
   apt update \
-  && apt install -y build-essential libpq-dev \
-  && rm -rf /var/lib/apt/lists/* \
-  && pip install --upgrade pip setuptools wheel
+  && apt install -y build-essential libpq-dev python3 python3-pip python3-virtualenv \
+  && rm -rf /var/lib/apt/lists/* && virtualenv /app
 
 WORKDIR /app
 
 COPY requirements.txt .
 
+ENV PATH="/app/bin:$PATH"
+
 RUN \
-  pip3 install --no-cache-dir -r requirements.txt \
-  && mkdir -p logs
+  pip install --no-cache-dir -r requirements.txt \
+  &&  mkdir -p logs
 
 COPY searcch_backend ./searcch_backend
 COPY setup.cfg setup.py run.py ./
